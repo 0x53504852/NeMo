@@ -789,7 +789,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 rc=math.ceil(right_offset / self.encoder.subsampling_factor),
             )
         total_preds = torch.cat([total_preds, chunk_preds], dim=1)
-
+        import pdb;pdb.set_trace()
         return streaming_state, total_preds
 
     def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:

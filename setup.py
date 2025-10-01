@@ -158,6 +158,12 @@ extras_require['deploy'] = list(
     )
 )
 
+install_requires = list(
+    chain(
+        install_requires,
+        extras_require["asr"],
+    )
+)
 
 ###############################################################################
 #                            Code style checkers                              #
@@ -231,7 +237,7 @@ class StyleCommand(distutils_cmd.Command):
 
 
 ###############################################################################
-
+#raise ValueError(str(install_requires))
 setuptools.setup(
     name=__package_name__,
     # Versions should comply with PEP440.  For a discussion on single-sourcing

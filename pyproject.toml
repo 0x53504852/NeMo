@@ -22,7 +22,7 @@ dynamic = ["dependencies", "optional-dependencies", "version"]
 description = "NeMo - a toolkit for Conversational AI"
 readme = "README.md"
 license = {file = "LICENSE"}
-requires-python = ">=3.10"
+requires-python = "~=3.11"
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -80,6 +80,8 @@ known_third_party = ["nemo_text_processing", "examples", "scripts"]  # THIRDPART
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
 default_section = "THIRDPARTY"
 extend_skip = ["setup.py", "docs/source/conf.py"]
+
+
 
 
 [tool.black]
