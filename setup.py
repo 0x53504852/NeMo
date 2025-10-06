@@ -158,6 +158,13 @@ extras_require['deploy'] = list(
     )
 )
 
+install_requires = list(
+    chain(
+        install_requires,
+        extras_require["asr"],
+        extras_require["nlp"]
+    )
+)
 
 ###############################################################################
 #                            Code style checkers                              #

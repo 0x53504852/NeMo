@@ -322,7 +322,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         with torch.no_grad():
             preds = self.forward(audio_signal=batch[0], audio_signal_length=batch[1])
-            preds = preds.to('cpu')
+            for pred in preds:
+                pred = pred.to('cpu')
+            #preds = preds.to('cpu')
             torch.cuda.empty_cache()
         return preds
 
@@ -349,36 +351,41 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             preds_list (List[torch.Tensor]): A list of tensors containing the diarization outputs
                                              for each audio file.
         """
-        preds_list, diar_output_lines_list = [], []
-        if outputs.shape[0] == 1:  # batch size = 1
-            preds_list.append(outputs)
-        else:
-            preds_list.extend(torch.split(outputs, [1] * outputs.shape[0]))
+        sequenced_preds_list = []
+        if outputs[0].shape[0] == 1:  # batch size = 1
+            for output in outputs:
+                sequenced_preds_list.append([output])
+        total_result = []
+        offsets = [0]
+        
+        for preds_list in sequenced_preds_list:
+            diar_output_lines_list = []
+            for sample_idx, uniq_id in enumerate(uniq_ids):
+                offset = self._diarize_audio_rttm_map[uniq_id]['offset']
+                speaker_assign_mat = preds_list[sample_idx].squeeze(dim=0)
+                offsets.append(speaker_assign_mat.shape[0] / 12.5)
+                speaker_assign_mat = torch.cat([speaker_assign_mat], dim=0)
+                
+                speaker_timestamps = [[] for _ in range(speaker_assign_mat.shape[-1])]
+                for spk_id in range(speaker_assign_mat.shape[-1]):
+                    ts_mat = ts_vad_post_processing(
+                        speaker_assign_mat[:, spk_id],
+                        cfg_vad_params=diarcfg.postprocessing_params,
+                        unit_10ms_frame_count=int(self._cfg.encoder.subsampling_factor),
+                        bypass_postprocessing=False,
+                    )
+                    
+                    ts_mat = ts_mat + offset
+                    ts_seg_raw_list = ts_mat.tolist()
+                    ts_seg_list = [[round(stt, 2), round(end, 2)] for (stt, end) in ts_seg_raw_list]
+                    speaker_timestamps[spk_id].extend(ts_seg_list)
 
-        for sample_idx, uniq_id in enumerate(uniq_ids):
-            offset = self._diarize_audio_rttm_map[uniq_id]['offset']
-            speaker_assign_mat = preds_list[sample_idx].squeeze(dim=0)
-            speaker_timestamps = [[] for _ in range(speaker_assign_mat.shape[-1])]
-            for spk_id in range(speaker_assign_mat.shape[-1]):
-                ts_mat = ts_vad_post_processing(
-                    speaker_assign_mat[:, spk_id],
-                    cfg_vad_params=diarcfg.postprocessing_params,
-                    unit_10ms_frame_count=int(self._cfg.encoder.subsampling_factor),
-                    bypass_postprocessing=False,
+                diar_output_lines = generate_diarization_output_lines(
+                    speaker_timestamps=speaker_timestamps, model_spk_num=len(speaker_timestamps)
                 )
-                ts_mat = ts_mat + offset
-                ts_seg_raw_list = ts_mat.tolist()
-                ts_seg_list = [[round(stt, 2), round(end, 2)] for (stt, end) in ts_seg_raw_list]
-                speaker_timestamps[spk_id].extend(ts_seg_list)
-
-            diar_output_lines = generate_diarization_output_lines(
-                speaker_timestamps=speaker_timestamps, model_spk_num=len(speaker_timestamps)
-            )
-            diar_output_lines_list.append(diar_output_lines)
-        if diarcfg.include_tensor_outputs:
-            return (diar_output_lines_list, preds_list)
-        else:
-            return diar_output_lines_list
+                diar_output_lines_list.append(diar_output_lines)
+            total_result.append(diar_output_lines)
+        return total_result, offsets
 
     def _setup_diarize_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
         """
@@ -629,7 +636,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         streaming_state = self.sortformer_modules.init_streaming_state(
             batch_size=processed_signal.shape[0], async_streaming=self.async_streaming, device=self.device
         )
-
+        def first_true_index(x: torch.Tensor):
+            idxs = torch.nonzero(x, as_tuple=False).squeeze(1)
+            return idxs[0].item() if idxs.numel() > 0 else None
         batch_size, ch, sig_length = processed_signal.shape
         processed_signal_offset = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
 
@@ -664,20 +673,33 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         total_preds = torch.zeros((batch_size, 0, self.sortformer_modules.n_spk), device=self.device)
 
         feat_len = processed_signal.shape[2]
-        num_chunks = math.ceil(
-            feat_len / (self.sortformer_modules.chunk_len * self.sortformer_modules.subsampling_factor)
-        )
-        streaming_loader = self.sortformer_modules.streaming_feat_loader(
-            feat_seq=processed_signal,
-            feat_seq_length=processed_signal_length,
-            feat_seq_offset=processed_signal_offset,
-        )
-        for _, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
-            streaming_loader,
-            total=num_chunks,
-            desc="Streaming Steps",
-            disable=self.training,
-        ):
+        #num_chunks = math.ceil(
+        #    feat_len / (self.sortformer_modules.chunk_len * self.sortformer_modules.subsampling_factor)
+        #)
+        
+        #streaming_loader = self.sortformer_modules.streaming_feat_loader(
+        #    feat_seq=processed_signal,
+        #    feat_seq_length=processed_signal_length,
+        #    feat_seq_offset=processed_signal_offset,
+        #)
+
+        result = []
+
+
+        stt_feat, end_feat = 0, 0
+        while end_feat < processed_signal.shape[2]:
+            # Moved the loader logic here to be more flexible with the change of indexes if we find a fourth speaker 
+            left_offset = min(self.sortformer_modules.chunk_left_context * self.sortformer_modules.subsampling_factor, stt_feat)
+            end_feat = min(stt_feat + self.sortformer_modules.chunk_len * self.sortformer_modules.subsampling_factor, feat_len)
+            right_offset = min(self.sortformer_modules.chunk_right_context * self.sortformer_modules.subsampling_factor, feat_len - end_feat)
+            chunk_feat_seq = processed_signal[:, :, stt_feat - left_offset : end_feat + right_offset]
+            feat_lengths = (processed_signal_length + processed_signal_offset - stt_feat + left_offset).clamp(
+                0, chunk_feat_seq.shape[2]
+            )
+            feat_lengths = feat_lengths * (processed_signal_offset < end_feat)
+            stt_feat = end_feat
+            chunk_feat_seq_t = torch.transpose(chunk_feat_seq, 1, 2)
+            
             streaming_state, total_preds = self.forward_streaming_step(
                 processed_signal=chunk_feat_seq_t,
                 processed_signal_length=feat_lengths,
@@ -686,17 +708,22 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 left_offset=left_offset,
                 right_offset=right_offset,
             )
-
+            is_fourth_speaker_tensor = total_preds[0,:,3] > 0.5 # Is there a fourth speaker
+            if torch.any(is_fourth_speaker_tensor):
+                streaming_state = self.sortformer_modules.init_streaming_state(
+                    batch_size=processed_signal.shape[0], async_streaming=self.async_streaming, device=self.device
+                )
+                idx_first_zero = first_true_index(is_fourth_speaker_tensor)
+                result.append(total_preds[:,:idx_first_zero,:])
+                stt_feat = end_feat - (total_preds.shape[1] - idx_first_zero) * self.sortformer_modules.subsampling_factor
+                total_preds = torch.zeros((batch_size, 0, self.sortformer_modules.n_spk), device=self.device)
+        result.append(total_preds)
         if att_mod:
             self.encoder.att_context_size = [-1, -1]
             self.transformer_encoder.diag = None
 
         del processed_signal, processed_signal_length
-
-        if sig_length < max_n_frames:  # Discard preds corresponding to padding
-            n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
-            total_preds = total_preds[:, :n_frames, :]
-        return total_preds
+        return result
 
     def forward_streaming_step(
         self,
@@ -789,7 +816,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 rc=math.ceil(right_offset / self.encoder.subsampling_factor),
             )
         total_preds = torch.cat([total_preds, chunk_preds], dim=1)
-
         return streaming_state, total_preds
 
     def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:
@@ -1126,3 +1152,4 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             verbose=verbose,
             override_config=override_config,
         )
+
